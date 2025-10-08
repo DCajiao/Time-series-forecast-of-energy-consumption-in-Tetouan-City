@@ -1,5 +1,6 @@
 # app.py
 import io
+import datetime
 import numpy as np
 import pandas as pd
 import requests
@@ -29,109 +30,157 @@ DROPOUT = 0.1
 HIDDEN_CONT = 32
 QUANTILES = [0.05, 0.1, 0.2, 0.5, 0.8, 0.9, 0.95]  # 7 cuantiles (como el checkpoint)
 
-PRED_LEN = 24 * 6          # 144 pasos (24h a 10min)
-ENCODER_LEN = 7 * 24 * 6   # ~7 días
+PRED_LEN_DEFAULT = 24 * 6          # 144 pasos (24h a 10min)
+ENCODER_LEN = 7 * 24 * 6           # ~7 días encoder
+FREQ = "10min"                     # resolución base
 
 
 # =========================
-# Utilidades métricas
+# Helpers
 # =========================
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-    yt = y_true.reshape(-1)
-    yp = y_pred.reshape(-1)
+@st.cache_data(show_spinner=False)
+def load_hist_df(url: str) -> pd.DataFrame:
+    df = pd.read_csv(url)
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
 
-    from sklearn.metrics import mean_absolute_error, mean_squared_error
-    mae = mean_absolute_error(yt, yp)
-    try:
-        rmse = mean_squared_error(yt, yp, squared=False)
-    except TypeError:
-        rmse = np.sqrt(mean_squared_error(yt, yp))
+    t0 = df["datetime"].min()
+    df["time_idx"] = ((df["datetime"] - t0) / pd.Timedelta(minutes=10)).astype(int)
 
-    mask = yt != 0
-    mape = (np.abs((yt[mask] - yp[mask]) / yt[mask]).mean() * 100) if mask.any() else np.nan
+    # calendario
+    df["day_of_week"] = df["datetime"].dt.dayofweek
+    df["hour"] = df["datetime"].dt.hour
+    df["day"] = df["datetime"].dt.day
+    df["month"] = df["datetime"].dt.month
+    df["is_weekend"] = df["day_of_week"] >= 5
+    df["is_holiday"] = False
 
-    denom = (np.abs(yt) + np.abs(yp))
-    sm_mask = denom != 0
-    smape = (2.0 * np.abs(yt[sm_mask] - yp[sm_mask]) / denom[sm_mask]).mean() * 100 if sm_mask.any() else np.nan
+    # grupo
+    df["zone"] = "zone_1"
+    df = df.sort_values(["zone", "time_idx"]).reset_index(drop=True)
 
-    wape = (np.abs(yt - yp).sum() / np.abs(yt).sum()) * 100 if np.abs(yt).sum() != 0 else np.nan
-    return {"MAE": mae, "RMSE": rmse, "MAPE": mape, "sMAPE": smape, "WAPE": wape}
+    # sanity
+    expected_cols = {"temperature", "humidity", "general_diffuse_flows", "zone_1"}
+    missing = expected_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Faltan columnas en el dataset: {missing}")
+    if df["zone_1"].isna().any():
+        raise ValueError("NaN en target 'zone_1'. Limpia o imputa antes.")
+
+    return df
+
+
+def add_calendar_feats(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["day_of_week"] = df["datetime"].dt.dayofweek
+    df["hour"] = df["datetime"].dt.hour
+    df["day"] = df["datetime"].dt.day
+    df["month"] = df["datetime"].dt.month
+    df["is_weekend"] = df["day_of_week"] >= 5
+    df["is_holiday"] = False
+    return df
+
+
+def make_future_df(
+    hist_df: pd.DataFrame,
+    start_dt: pd.Timestamp,
+    horizon: int,
+    exo_source: str,
+    const_values: dict | None = None,
+    exo_table: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    Construye el DF futuro (decoder) con covariables conocidas para el horizonte.
+    exo_source: 'const' o 'table'
+    const_values: dict con valores por variable (se replican en todo el horizonte)
+    exo_table: DataFrame con columnas ['temperature','humidity','wind_speed','general_diffuse_flows'] y len==horizon
+    """
+    hist_df = hist_df.copy()
+    hist_df["is_future"] = False
+    t0 = hist_df["datetime"].min()
+
+    # rango temporal para el futuro
+    future_dt = pd.date_range(start=start_dt, periods=horizon, freq=FREQ, inclusive="left")
+    fut = pd.DataFrame({"datetime": future_dt})
+    fut["time_idx"] = ((fut["datetime"] - t0) / pd.Timedelta(minutes=10)).astype(int)
+    fut["zone"] = "zone_1"
+
+    # calendario
+    fut = add_calendar_feats(fut)
+
+    # exógenas
+    exo_cols = ["temperature", "humidity", "wind_speed", "general_diffuse_flows"]
+    if exo_source == "const":
+        const_values = const_values or {}
+        for c in exo_cols:
+            val = const_values.get(c, 0.0)
+            fut[c] = float(val)
+    else:
+        # tabla subida por usuario
+        if exo_table is None:
+            raise ValueError("Debes subir el CSV de exógenas o elegir 'Constantes'.")
+        # normalizamos columnas esperadas
+        table = exo_table.copy()
+        table.columns = [c.strip().lower() for c in table.columns]
+        col_map = {
+            "temperature": "temperature",
+            "temp": "temperature",
+            "humidity": "humidity",
+            "hum": "humidity",
+            "wind_speed": "wind_speed",
+            "wind": "wind_speed",
+            "general_diffuse_flows": "general_diffuse_flows",
+            "gdf": "general_diffuse_flows",
+            "radiation": "general_diffuse_flows",
+        }
+        # crear frame vacío con columnas esperadas
+        tbl = pd.DataFrame(index=range(len(fut)), columns=exo_cols, dtype=float)
+        for src_col, dst_col in col_map.items():
+            if src_col in table.columns:
+                tbl[dst_col] = pd.to_numeric(table[src_col], errors="coerce")
+
+        if len(tbl) != len(fut):
+            raise ValueError(f"El CSV debe tener {len(fut)} filas (una por paso del horizonte).")
+        if tbl[exo_cols].isna().any().any():
+            raise ValueError("Hay NaNs en las exógenas del CSV. Revisa el archivo.")
+        fut[exo_cols] = tbl[exo_cols].values
+
+    # el target futuro es desconocido
+    fut["zone_1"] = 0.0
+    fut["is_future"] = True
+
+    # concatenamos histórico + futuro
+    full = pd.concat([hist_df, fut], ignore_index=True)
+    return full
 
 
 # =========================
-# Data Manager
+# Data / Model Managers
 # =========================
 class DataManager:
-    def __init__(
-        self,
-        csv_url: str = RAW_DATA_URL,
-        prediction_length: int = PRED_LEN,
-        max_encoder_length: int = ENCODER_LEN,
-        weather_as_known: bool = True,   # ← para calzar con el checkpoint
-    ):
-        self.csv_url = csv_url
+    def __init__(self, prediction_length=PRED_LEN_DEFAULT, max_encoder_length=ENCODER_LEN, weather_as_known=True):
         self.prediction_length = prediction_length
         self.max_encoder_length = max_encoder_length
         self.weather_as_known = weather_as_known
 
-        self.df: Optional[pd.DataFrame] = None
         self.training: Optional[TimeSeriesDataSet] = None
-        self.validation: Optional[TimeSeriesDataSet] = None
-        self.train_dataloader: Optional[DataLoader] = None
-        self.val_dataloader: Optional[DataLoader] = None
 
         self.time_varying_known_reals: List[str] = []
         self.time_varying_unknown_reals: List[str] = []
 
-    @st.cache_data(show_spinner=False)
-    def load_dataframe(_self) -> pd.DataFrame:
-        df = pd.read_csv(_self.csv_url)
-        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
-
-        t0 = df["datetime"].min()
-        df["time_idx"] = ((df["datetime"] - t0) / pd.Timedelta(minutes=10)).astype(int)
-
-        expected_cols = {"temperature", "humidity", "general_diffuse_flows", "zone_1"}
-        missing = expected_cols - set(df.columns)
-        if missing:
-            raise ValueError(f"Faltan columnas en el dataset: {missing}.")
-
-        # calendario
-        df["day_of_week"] = df["datetime"].dt.dayofweek
-        df["hour"] = df["datetime"].dt.hour
-        df["day"] = df["datetime"].dt.day
-        df["month"] = df["datetime"].dt.month
-        df["is_weekend"] = df["day_of_week"] >= 5
-        df["is_holiday"] = False
-
-        df["zone"] = "zone_1"
-        df = df.sort_values(["zone", "time_idx"]).reset_index(drop=True)
-
-        if df["zone_1"].isna().any():
-            raise ValueError("NaN en target 'zone_1'. Limpia o imputa antes.")
-
-        _self.df = df
-        return df
-
-    def make_datasets(self) -> Tuple[TimeSeriesDataSet, TimeSeriesDataSet]:
-        if self.df is None:
-            raise RuntimeError("Primero ejecuta load_dataframe().")
-
-        df = self.df
-        training_cutoff = df["time_idx"].max() - self.prediction_length
-
-        known_reals = ["time_idx", "hour", "day", "day_of_week", "month", "is_weekend", "is_holiday"]
+    def make_training_from_hist(self, df: pd.DataFrame) -> TimeSeriesDataSet:
+        # variables
+        known_reals_base = ["time_idx", "hour", "day", "day_of_week", "month", "is_weekend", "is_holiday", "is_future"]
         weather = ["temperature", "humidity"] + (["wind_speed"] if "wind_speed" in df.columns else []) + ["general_diffuse_flows"]
 
         if self.weather_as_known:
-            self.time_varying_known_reals = known_reals + weather
+            self.time_varying_known_reals = known_reals_base + weather
             self.time_varying_unknown_reals = ["zone_1"]
         else:
-            self.time_varying_known_reals = known_reals
+            self.time_varying_known_reals = known_reals_base
             self.time_varying_unknown_reals = ["zone_1"] + weather
 
         training = TimeSeriesDataSet(
-            df[df.time_idx <= training_cutoff],
+            df,  # OJO: creamos sobre TODO el histórico
             time_idx="time_idx",
             target="zone_1",
             group_ids=["zone"],
@@ -147,45 +196,20 @@ class DataManager:
             add_target_scales=True,
             add_encoder_length=True,
         )
-        validation = TimeSeriesDataSet.from_dataset(training, df, predict=True, stop_randomization=True)
-
         self.training = training
-        self.validation = validation
-        return training, validation
+        return training
 
-    def make_dataloaders(self, batch_size: int = 64, num_workers: int = 0) -> Tuple[DataLoader, DataLoader]:
-        # num_workers=0 para compatibilidad amplia con entornos locales/Windows
-        if self.training is None or self.validation is None:
-            raise RuntimeError("Primero ejecuta make_datasets().")
-        self.train_dataloader = self.training.to_dataloader(train=True, batch_size=batch_size, num_workers=num_workers)
-        self.val_dataloader = self.validation.to_dataloader(train=False, batch_size=batch_size * 4, num_workers=num_workers)
-        return self.train_dataloader, self.val_dataloader
+    def make_predict_from_training(self, training: TimeSeriesDataSet, df_with_future: pd.DataFrame) -> DataLoader:
+        # creamos dataset de predicción reusando normalizadores
+        predict_ds = TimeSeriesDataSet.from_dataset(training, df_with_future, predict=True, stop_randomization=True)
+        predict_dl = predict_ds.to_dataloader(train=False, batch_size=64, num_workers=0)
+        return predict_dl
 
 
-# =========================
-# Model Manager
-# =========================
 class ModelManager:
-    def __init__(
-        self,
-        training_dataset: TimeSeriesDataSet,
-        device: Optional[str] = None,
-        state_dict_url: str = RAW_STATE_DICT_URL,
-        learning_rate: float = LEARNING_RATE,
-        hidden_size: int = HIDDEN_SIZE,
-        attention_head_size: int = ATTN_HEADS,
-        dropout: float = DROPOUT,
-        hidden_continuous_size: int = HIDDEN_CONT,
-        quantiles: Optional[List[float]] = None,
-    ):
+    def __init__(self, training_dataset: TimeSeriesDataSet, quantiles: Optional[List[float]] = None):
         self.training_dataset = training_dataset
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.state_dict_url = state_dict_url
-        self.learning_rate = learning_rate
-        self.hidden_size = hidden_size
-        self.attention_head_size = attention_head_size
-        self.dropout = dropout
-        self.hidden_continuous_size = hidden_continuous_size
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.quantiles = quantiles or QUANTILES
         self.tft: Optional[TemporalFusionTransformer] = None
 
@@ -193,11 +217,11 @@ class ModelManager:
     def build_model(_self):
         tft = TemporalFusionTransformer.from_dataset(
             _self.training_dataset,
-            learning_rate=_self.learning_rate,
-            hidden_size=_self.hidden_size,
-            attention_head_size=_self.attention_head_size,
-            dropout=_self.dropout,
-            hidden_continuous_size=_self.hidden_continuous_size,
+            learning_rate=LEARNING_RATE,
+            hidden_size=HIDDEN_SIZE,
+            attention_head_size=ATTN_HEADS,
+            dropout=DROPOUT,
+            hidden_continuous_size=HIDDEN_CONT,
             loss=QuantileLoss(quantiles=_self.quantiles),
         )
         tft.to(_self.device)
@@ -205,10 +229,10 @@ class ModelManager:
         _self.tft = tft
         return tft
 
-    def load_state_dict_from_url(self):
+    def load_state_dict_from_url(self, url: str = RAW_STATE_DICT_URL):
         if self.tft is None:
             raise RuntimeError("Primero ejecuta build_model().")
-        resp = requests.get(self.state_dict_url, timeout=60)
+        resp = requests.get(url, timeout=60)
         resp.raise_for_status()
         buffer = BytesIO(resp.content)
         state = torch.load(buffer, map_location=self.device)
@@ -219,220 +243,184 @@ class ModelManager:
     @torch.no_grad()
     def predict_raw(self, dataloader: DataLoader):
         if self.tft is None:
-            raise RuntimeError("Primero build_model() y luego load_state_dict_from_url().")
+            raise RuntimeError("Primero build_model() y load_state_dict_from_url().")
         return self.tft.predict(dataloader, mode="raw", return_x=True)
 
-    @torch.no_grad()
-    def predict_p50(self, dataloader: DataLoader) -> np.ndarray:
-        raw = self.predict_raw(dataloader)
-        preds = raw.output[0].detach().cpu().numpy()  # (n_samples, L, n_quantiles)
-        q = self.tft.loss.quantiles
-        try:
-            mid = q.index(0.5)
-        except ValueError:
-            mid = len(q) // 2
-        return preds[:, :, mid], raw  # devuelvo también el raw para gráficos
-
 
 # =========================
-# Plotting helpers (matplotlib)
+# Plotting
 # =========================
-def plot_sample(raw, sample_idx: int, title: str = "Predicción (p50) con banda p10–p90"):
-    """
-    Dibuja histórico (encoder), futuro real (decoder) y cuantiles p10/p50/p90 del sample seleccionado.
-    """
+def plot_prediction_from_raw(raw, idx: int = 0, title="Predicción (p50) con banda p10–p90"):
     x = raw.x
-
-    encoder_target = x["encoder_target"][sample_idx].cpu().numpy().flatten()
-    decoder_target = x["decoder_target"][sample_idx].cpu().numpy().flatten()
-    decoder_time = x["decoder_time_idx"][sample_idx].cpu().numpy().flatten()
+    encoder_target = x["encoder_target"][idx].cpu().numpy().flatten()
+    decoder_target = x["decoder_target"][idx].cpu().numpy().flatten()
+    decoder_time = x["decoder_time_idx"][idx].cpu().numpy().flatten()
     encoder_time = np.arange(decoder_time[0] - len(encoder_target), decoder_time[0])
 
-    preds = raw.output[0][sample_idx].detach().cpu().numpy()  # (L, n_quant)
-
-    # Buscar índices de p10/p50/p90
+    preds = raw.output[0][idx].detach().cpu().numpy()  # (L, n_quant)
     q_list = QUANTILES
-    def q_idx(q):
-        return q_list.index(q) if q in q_list else None
-
-    p10 = q_idx(0.1)
-    p50 = q_idx(0.5)
-    p90 = q_idx(0.9)
+    q_idx = {q: q_list.index(q) for q in [0.1, 0.5, 0.9] if q in q_list}
 
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(encoder_time, encoder_target, label="Histórico (encoder)", linewidth=1.5)
-    ax.plot(decoder_time, decoder_target, label="Real futuro (decoder)", linewidth=1.5)
+    if len(decoder_target) and not np.isnan(decoder_target).all():
+        ax.plot(decoder_time, decoder_target, label="Real futuro (si disponible)", linewidth=1.5)
 
-    if p50 is not None:
-        ax.plot(decoder_time, preds[:, p50], label="Pred p50", linestyle="--")
-
-    if p10 is not None and p90 is not None:
-        ax.fill_between(decoder_time, preds[:, p10], preds[:, p90], alpha=0.3, label="Banda p10–p90")
+    if 0.5 in q_idx:
+        ax.plot(decoder_time, preds[:, q_idx[0.5]], label="Pred p50", linestyle="--")
+    if 0.1 in q_idx and 0.9 in q_idx:
+        ax.fill_between(decoder_time, preds[:, q_idx[0.1]], preds[:, q_idx[0.9]], alpha=0.3, label="Banda p10–p90")
 
     ax.set_title(title)
     ax.set_xlabel("time_idx (10-min)")
-    ax.set_ylabel("Consumo (unidades originales)")
+    ax.set_ylabel("Consumo (kW)")
     ax.legend()
     st.pyplot(fig)
 
 
-def build_predictions_dataframe(raw, p50: np.ndarray) -> pd.DataFrame:
-    """
-    Construye un DataFrame con decoder_time_idx, y_true y pred_p50 para todas las muestras.
-    """
-    x = raw.x
-    all_rows = []
-    for i in range(len(x["decoder_target"])):
-        decoder_target = x["decoder_target"][i].cpu().numpy().flatten()
-        decoder_time = x["decoder_time_idx"][i].cpu().numpy().flatten()
-        df_i = pd.DataFrame({
-            "sample_idx": i,
-            "decoder_time_idx": decoder_time,
-            "y_true": decoder_target,
-            "y_pred_p50": p50[i]
-        })
-        all_rows.append(df_i)
-    return pd.concat(all_rows, ignore_index=True)
-
-
 # =========================
-# Streamlit UI
+# UI
 # =========================
-st.set_page_config(page_title="TFT — Consumo eléctrico Zone_1 (Tetuán)", layout="wide")
-st.title("🔌 Temporal Fusion Transformer — Consumo eléctrico (Zone_1, 10-min)")
-st.caption("Carga modelo y datos desde GitHub, ejecuta inferencia y visualiza predicciones con bandas cuantílicas.")
+st.set_page_config(page_title="TFT — Pronóstico con exógenas", layout="wide")
+st.title("🔌 TFT — Pronóstico de consumo (Zone_1) con entradas exógenas")
+st.caption("Carga modelo/datos desde GitHub, ingresa exógenas y genera pronóstico a 10 minutos.")
 
 with st.sidebar:
-    st.header("Configuración")
-    st.markdown("**Fuentes (RAW GitHub):**")
-    st.code(f"CSV:  {RAW_DATA_URL}\nSTATE: {RAW_STATE_DICT_URL}", language="text")
-    weather_known = st.checkbox("Tratar clima como KNOWN (coincide con checkpoint)", value=True, help="Dejar activado para usar el state_dict publicado")
-    batch_size = st.slider("Batch size validación", min_value=16, max_value=256, value=64, step=16)
-    # Nota: el selector de sample lo pondremos después, cuando existan datos reales del batch
-    run_btn = st.button("🚀 Cargar y predecir")
+    st.header("Parámetros de pronóstico")
+    horizon = st.number_input("Horizonte (pasos de 10 min)", min_value=6, max_value=7*24*6, value=PRED_LEN_DEFAULT, step=6)
+    exo_mode = st.radio("Modo de exógenas", options=["Constantes", "CSV (subir)"], index=0)
 
-# --------- Pipeline principal (solo al pulsar botón) ---------
-if run_btn:
-    try:
-        with st.spinner("Cargando datos desde GitHub y preparando dataset…"):
-            dm = DataManager(
-                csv_url=RAW_DATA_URL,
-                prediction_length=PRED_LEN,
-                max_encoder_length=ENCODER_LEN,
-                weather_as_known=weather_known,
-            )
-            df = dm.load_dataframe()
-            training, validation = dm.make_datasets()
-            _, val_loader = dm.make_dataloaders(batch_size=batch_size, num_workers=0)
+    # placeholders de inputs
+    const_cols = {}
+    uploaded_file = None
 
-        st.success("Datos listos ✅")
-        st.write("**Decoder KNOWN reals:**", dm.time_varying_known_reals)
-        st.write("**Decoder UNKNOWN reals:**", dm.time_varying_unknown_reals)
-
-        with st.spinner("Reconstruyendo TFT y cargando pesos…"):
-            mm = ModelManager(training_dataset=training)
-            tft = mm.build_model()
-            mm.load_state_dict_from_url()
-
-        st.success("Modelo cargado ✅")
-        st.write(f"**Cuantiles del modelo:** {mm.tft.loss.quantiles}")
-
-        with st.spinner("Haciendo predicción…"):
-            p50, raw = mm.predict_p50(val_loader)
-
-        # Construir y_true para métricas
-        y_true_list = [yb[0].detach().cpu().numpy() for _, yb in val_loader]
-        y_true = np.concatenate(y_true_list, axis=0)
-
-        # 🔒 Persistimos en sesión para reruns (por ejemplo, al cambiar el sample)
-        st.session_state["dm"] = dm
-        st.session_state["mm"] = mm
-        st.session_state["val_loader"] = val_loader
-        st.session_state["raw"] = raw
-        st.session_state["p50"] = p50
-        st.session_state["y_true"] = y_true
-        st.session_state["ready"] = True
-
-    except Exception as ex:
-        st.error(f"⚠️ Ocurrió un error: {ex}")
-        st.stop()
-
-# --------- Visualización / Métricas usando estado persistente ---------
-if st.session_state.get("ready", False):
-    raw = st.session_state["raw"]
-    p50 = st.session_state["p50"]
-    y_true = st.session_state["y_true"]
-    val_loader = st.session_state["val_loader"]
-    dm: DataManager = st.session_state["dm"]
-    mm: ModelManager = st.session_state["mm"]
-
-    # Límite real del batch actual
-    num_samples = len(raw.x["decoder_target"])
-    col_sel, col_gap = st.columns([1, 3])
-    with col_sel:
-        sample_to_plot = st.number_input(
-            "Sample del batch para graficar",
-            min_value=0,
-            max_value=max(0, num_samples - 1),
-            value=min(st.session_state.get("sample_idx", 0), max(0, num_samples - 1)),
-            step=1,
-            key="sample_idx",
-            help="Cada sample es una ventana (encoder ~7d + decoder 24h) distinta dentro del batch actual."
-        )
-
-    # Métricas
-    metrics = compute_metrics(y_true, p50)
-
-    col1, col2 = st.columns([1, 2], gap="large")
+# 1) Cargar histórico + preparar training
+with st.spinner("Cargando histórico y preparando normalizadores…"):
+    hist_df = load_hist_df(RAW_DATA_URL)
+    last_dt = hist_df["datetime"].max()
+    default_start = (last_dt + pd.Timedelta(minutes=10)).floor(FREQ)
+    col1, col2 = st.columns(2)
     with col1:
-        st.subheader("Métricas (validación, p50)")
-        mtable = pd.DataFrame({
-            "Métrica": ["MAE", "RMSE", "MAPE", "sMAPE", "WAPE"],
-            "Valor": [
-                f"{metrics['MAE']:.3f}",
-                f"{metrics['RMSE']:.3f}",
-                f"{metrics['MAPE']:.2f}%",
-                f"{metrics['sMAPE']:.2f}%",
-                f"{metrics['WAPE']:.2f}%"
-            ]
-        })
-        st.table(mtable)
-
-        # Último punto del horizonte del sample seleccionado
-        t_final = -1
-        try:
-            y_last = raw.x["decoder_target"][sample_to_plot][t_final].item()
-            preds_sample = raw.output[0][sample_to_plot].detach().cpu().numpy()
-            q_list = mm.tft.loss.quantiles
-            row = {"Valor real (último paso)": y_last}
-            for q in [0.1, 0.5, 0.9]:
-                if q in q_list:
-                    qidx = q_list.index(q)
-                    row[f"p{int(q*100)}"] = float(preds_sample[t_final, qidx])
-            st.subheader("Último paso del horizonte (sample seleccionado)")
-            st.table(pd.DataFrame([row]))
-        except Exception as e:
-            st.warning(f"No se pudo mostrar el último paso: {e}")
-
+        start_date = st.date_input("Fecha de inicio", value=default_start.date())
     with col2:
-        st.subheader("Predicción — sample seleccionado")
-        plot_sample(raw, int(sample_to_plot))
+        start_time = st.time_input("Hora de inicio", value=default_start.time())
 
-    # Tabla de predicciones y descarga
-    st.subheader("Predicciones (todas las muestras del batch)")
-    pred_df = build_predictions_dataframe(raw, p50)
-    st.dataframe(pred_df.head(500), width='stretch')  # ← evita deprecación use_container_width
+    start_dt = datetime.datetime.combine(start_date, start_time)
 
-    csv_buf = io.StringIO()
-    pred_df.to_csv(csv_buf, index=False)
-    st.download_button(
-        label="⬇️ Descargar predicciones (CSV)",
-        data=csv_buf.getvalue(),
-        file_name="predicciones_tft_zone1.csv",
-        mime="text/csv",
-    )
+    dm = DataManager(prediction_length=int(horizon), max_encoder_length=ENCODER_LEN, weather_as_known=True)
+    training = dm.make_training_from_hist(hist_df)
 
-# ====== Footer ======
-st.markdown("---")
-st.caption("TFT con PyTorch Forecasting — Zone_1 (Tetuán, 2017, resolución 10-min). "
-           "Predicción 24h, clima como KNOWN para coincidir con el checkpoint publicado.")
+# 2) Entradas exógenas
+with st.sidebar:
+    if exo_mode == "Constantes":
+        st.subheader("Valores constantes (para todo el horizonte)")
+        const_cols["temperature"] = st.number_input("temperature (°C)", value=float(hist_df["temperature"].tail(144).median()))
+        const_cols["humidity"] = st.number_input("humidity (%)", value=float(hist_df["humidity"].tail(144).median()))
+        wind_guess = float(hist_df["wind_speed"].tail(144).median()) if "wind_speed" in hist_df.columns else 0.0
+        const_cols["wind_speed"] = st.number_input("wind_speed (m/s)", value=wind_guess)
+        const_cols["general_diffuse_flows"] = st.number_input("general_diffuse_flows (W/m²)", value=float(hist_df["general_diffuse_flows"].tail(144).median()))
+    else:
+        st.subheader("Sube CSV de exógenas")
+        st.markdown("Columnas esperadas (en cualquier mayúsc/minúsc): `temperature, humidity, wind_speed, general_diffuse_flows` con **una fila por paso**.")
+        uploaded_file = st.file_uploader("CSV exógenas para el horizonte", type=["csv"])
+        # botón para descargar template
+        template = pd.DataFrame({
+            "temperature": [float(hist_df["temperature"].tail(144).median())]*int(horizon),
+            "humidity": [float(hist_df["humidity"].tail(144).median())]*int(horizon),
+            "wind_speed": [float(hist_df["wind_speed"].tail(144).median()) if "wind_speed" in hist_df.columns else 0.0]*int(horizon),
+            "general_diffuse_flows": [float(hist_df["general_diffuse_flows"].tail(144).median())]*int(horizon),
+        })
+        buf = io.StringIO(); template.to_csv(buf, index=False)
+        st.download_button("⬇️ Descargar template CSV", data=buf.getvalue(), file_name="exo_template.csv", mime="text/csv")
+
+go_btn = st.button("🚀 Generar pronóstico")
+
+if go_btn:
+    try:
+        # 3) Construir DF con futuro según entradas
+        if exo_mode == "Constantes":
+            full_df = make_future_df(
+                hist_df,
+                pd.to_datetime(start_dt),
+                int(horizon),
+                exo_source="const",
+                const_values=const_cols
+            )
+        else:
+            if uploaded_file is None:
+                st.error("Sube un CSV con exógenas o cambia a modo 'Constantes'.")
+                st.stop()
+            exo_df = pd.read_csv(uploaded_file)
+            full_df = make_future_df(
+                hist_df,
+                pd.to_datetime(start_dt),
+                int(horizon),
+                exo_source="table",
+                exo_table=exo_df
+            )
+
+        # 4) Dataset de predicción reutilizando normalizadores del training
+        predict_dl = dm.make_predict_from_training(training, full_df)
+
+        # 5) Modelo + pesos
+        mm = ModelManager(training_dataset=training)
+        mm.build_model()
+        mm.load_state_dict_from_url(RAW_STATE_DICT_URL)
+
+        # 6) Predicción
+        with st.spinner("Inferencia…"):
+            raw = mm.predict_raw(predict_dl)
+
+        # 7) Armar DF de salida y métricas (si existen y_true en ese rango)
+        preds_all = raw.output[0].detach().cpu().numpy()  # (N, L, Q)
+        q_list = mm.tft.loss.quantiles
+        def qidx(q): return q_list.index(q) if q in q_list else None
+        mid = qidx(0.5) or (len(q_list)//2)
+        p50 = preds_all[:, :, mid]
+
+        # Construcción de marco de resultados (solo 1 muestra si usamos todo el futuro en una sola ventana)
+        # Pero según tamaño del dataloader pueden generarse varias ventanas. Unimos todas.
+        out_rows = []
+        for i in range(p50.shape[0]):
+            dec_time = raw.x["decoder_time_idx"][i].cpu().numpy().flatten()
+            y_true = raw.x["decoder_target"][i].cpu().numpy().flatten()
+            row = pd.DataFrame({
+                "sample_idx": i,
+                "decoder_time_idx": dec_time,
+                "y_true": y_true,
+                "y_pred_p50": p50[i]
+            })
+            out_rows.append(row)
+        pred_df = pd.concat(out_rows, ignore_index=True)
+
+        st.success("Pronóstico listo ✅")
+
+        # 8) Gráfico
+        st.subheader("Predicción (primer sample)")
+        plot_prediction_from_raw(raw, idx=0)
+
+        # 9) Métricas (solo si y_true existe en el rango elegido)
+        if not np.isnan(pred_df["y_true"]).all():
+            from sklearn.metrics import mean_absolute_error, mean_squared_error
+            yt = pred_df["y_true"].values
+            yp = pred_df["y_pred_p50"].values
+            mask = ~np.isnan(yt)
+            if mask.any():
+                mae = mean_absolute_error(yt[mask], yp[mask])
+                try:
+                    rmse = mean_squared_error(yt[mask], yp[mask], squared=False)
+                except TypeError:
+                    rmse = np.sqrt(mean_squared_error(yt[mask], yp[mask]))
+                st.markdown(f"**MAE:** {mae:.3f} — **RMSE:** {rmse:.3f}")
+        else:
+            st.info("No hay valores reales para el horizonte elegido (solo predicción).")
+
+        # 10) Tabla + descarga
+        st.subheader("Predicciones (todas las ventanas generadas)")
+        st.dataframe(pred_df.head(500), width='stretch')
+        csv_buf = io.StringIO(); pred_df.to_csv(csv_buf, index=False)
+        st.download_button("⬇️ Descargar predicciones (CSV)", data=csv_buf.getvalue(),
+                           file_name="predicciones_tft_input_exog.csv", mime="text/csv")
+
+    except Exception as e:
+        st.error(f"⚠️ Error durante el pronóstico: {e}")
