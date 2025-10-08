@@ -18,5 +18,6 @@ COPY pyproject.toml ./
 RUN uv pip install -r pyproject.toml --system
 
 COPY ./src ./
-EXPOSE 5000
-CMD ["python", "main.py"]
+
+EXPOSE 8501
+CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
