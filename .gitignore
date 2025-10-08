@@ -1,10 +1,10 @@
-.venv/
-.git/
-.gitignore
 __pycache__/
-.ipynb_checkpoints/
 *.pyc
+.env
+venv/
+*.lock
 test/
 __init__.py
 .DS_Store
+.ipynb_checkpoints
 lightning_logs/
