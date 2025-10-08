@@ -428,7 +428,7 @@ if go_btn:
                 rmse = np.sqrt(mean_squared_error(yt_hist, yp_hist))
             st.markdown(f"**MAE (histórico):** {mae:.3f} — **RMSE (histórico):** {rmse:.3f}")
         else:
-            st.info("No hay valores reales en el rango histórico del decoder para calcular métricas.")
+            st.info("Pronóstico puro: el horizonte seleccionado cae íntegramente en futuro (no hay valores reales para métricas).")
 
         # 10) Tabla + descarga
         st.subheader("Predicciones (todas las ventanas generadas)")
