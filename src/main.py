@@ -2,7 +2,7 @@
 import argparse
 from html import parser
 import numpy as np
-from sklearn.metrics import mean_absolute_error, root_mean_squared_error
+from sklearn.metrics import mean_absolute_error, root_mean_squared_error, mean_squared_error
 
 from core.data_manager import DataManager, RAW_DATA_URL
 from core.model_manager import ModelManager, RAW_STATE_DICT_URL
@@ -13,7 +13,10 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     yp = y_pred.reshape(-1)
 
     mae = mean_absolute_error(yt, yp)
-    rmse = root_mean_squared_error(yt, yp, squared=False)
+    try:
+        rmse = root_mean_squared_error(yt, yp, squared=False)  # sklearn >= 0.22
+    except TypeError:
+        rmse = np.sqrt(mean_squared_error(yt, yp))        # fallback
 
     mask = yt != 0
     mape = (np.abs((yt[mask] - yp[mask]) / yt[mask]).mean() * 100) if mask.any() else np.nan
