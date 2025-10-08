@@ -35,7 +35,7 @@ class ModelManager:
         self.attention_head_size = attention_head_size
         self.dropout = dropout
         self.hidden_continuous_size = hidden_continuous_size
-        self.quantiles = quantiles or [0.1, 0.5, 0.9]
+        self.quantiles = quantiles or [0.05, 0.1, 0.2, 0.5, 0.8, 0.9, 0.95]
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.state_dict_url = state_dict_url

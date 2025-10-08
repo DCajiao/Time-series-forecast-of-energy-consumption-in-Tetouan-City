@@ -26,7 +26,7 @@ class DataManager:
         csv_url: str = RAW_DATA_URL,
         prediction_length: int = 24 * 6,        # 24h * 6 = 144
         max_encoder_length: int = 7 * 24 * 6,   # ~7 días
-        weather_as_known: bool = False,         # por defecto: clima como UNKNOWN a futuro
+        weather_as_known: bool = True,         # por defecto: clima como UNKNOWN a futuro
     ):
         self.csv_url = csv_url
         self.prediction_length = prediction_length

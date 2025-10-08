@@ -1,5 +1,6 @@
 # main.py
 import argparse
+from html import parser
 import numpy as np
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error
 
@@ -30,7 +31,8 @@ def main():
     parser = argparse.ArgumentParser(description="Inferencia TFT — Consumo eléctrico Zone_1 (Tetuán)")
     parser.add_argument("--csv", type=str, default=RAW_DATA_URL, help="URL al CSV enriquecido (raw GitHub)")
     parser.add_argument("--state_dict_url", type=str, default=RAW_STATE_DICT_URL, help="URL raw al state_dict del TFT")
-    parser.add_argument("--weather_as_known", action="store_true", help="Tratar variables clima como conocidas a futuro")
+    parser.add_argument("--weather_as_known", action="store_true", help="(opcional) Ya está activado por defecto")
+
     args = parser.parse_args()
 
     # 1) Datos (usa por defecto el RAW de GitHub)
@@ -38,7 +40,7 @@ def main():
         csv_url=args.csv,
         prediction_length=24 * 6,
         max_encoder_length=7 * 24 * 6,
-        weather_as_known=args.weather_as_known,  # si pasas el flag, se activan como KNOWN
+        weather_as_known=True,  # fijo a True
     )
     df = dm.load_dataframe()
     training, validation = dm.make_datasets()
@@ -56,6 +58,8 @@ def main():
         state_dict_url=args.state_dict_url,
     )
     mm.build_model()
+    print("Decoder known reals (esperamos +4 de clima):",
+        dm.training._get_masked_variables("decoder", "reals", known=True))
     mm.load_state_dict_from_url()
 
     # 3) Predicción (validación como proxy)
