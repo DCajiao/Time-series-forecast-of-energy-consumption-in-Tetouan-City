@@ -1,14 +1,14 @@
 # data_manager.py
-from io import BytesIO
-from typing import Tuple, Optional, List, Dict
+from typing import Tuple, Optional
 import pandas as pd
 import numpy as np
 
 import torch
 from torch.utils.data import DataLoader
-
 from pytorch_forecasting import TimeSeriesDataSet
 from pytorch_forecasting.data import GroupNormalizer
+
+RAW_DATA_URL = "https://raw.githubusercontent.com/DCajiao/Time-series-forecast-of-energy-consumption-in-Tetouan-City/main/data/enriched_zone1_power_consumption_of_tetouan_city.csv"
 
 
 class DataManager:
@@ -17,18 +17,18 @@ class DataManager:
     Reproduce las transformaciones del notebook:
       - parseo de datetime
       - time_idx cada 10 minutos
-      - features de calendario (hour, day, day_of_week, month, is_weekend, is_holiday)
+      - features de calendario
       - validación de columnas mínimas
-      - construcción de TimeSeriesDataSet (train/val/predict)
+      - construcción de TimeSeriesDataSet (train/val)
     """
     def __init__(
         self,
-        csv_path_or_url: str,
+        csv_url: str = RAW_DATA_URL,
         prediction_length: int = 24 * 6,        # 24h * 6 = 144
         max_encoder_length: int = 7 * 24 * 6,   # ~7 días
-        weather_as_known: bool = True,          # Si no tienes pronóstico futuro, pon False
+        weather_as_known: bool = False,         # por defecto: clima como UNKNOWN a futuro
     ):
-        self.csv_path_or_url = csv_path_or_url
+        self.csv_url = csv_url
         self.prediction_length = prediction_length
         self.max_encoder_length = max_encoder_length
         self.weather_as_known = weather_as_known
@@ -43,7 +43,7 @@ class DataManager:
     # Carga y features
     # -------------------
     def load_dataframe(self) -> pd.DataFrame:
-        df = pd.read_csv(self.csv_path_or_url)  # local path o URL cruda a CSV
+        df = pd.read_csv(self.csv_url)  # lee directo desde raw GitHub
         df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
 
         # time_idx a resolución 10-min
@@ -63,8 +63,6 @@ class DataManager:
         df["day"] = df["datetime"].dt.day
         df["month"] = df["datetime"].dt.month
         df["is_weekend"] = df["day_of_week"] >= 5
-        # Si no tienes festivos, inicializa en False
-        df["is_holiday"] = False
 
         # ID de grupo (una sola zona)
         df["zone"] = "zone_1"
