@@ -7,3 +7,4 @@ __pycache__/
 test/
 __init__.py
 .DS_Store
+lightning_logs/
