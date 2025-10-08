@@ -66,6 +66,7 @@ def load_hist_df(url: str) -> pd.DataFrame:
     if df["zone_1"].isna().any():
         raise ValueError("NaN en target 'zone_1'. Limpia o imputa antes.")
 
+    df["is_future"] = 0
     return df
 
 
@@ -144,12 +145,16 @@ def make_future_df(
             raise ValueError("Hay NaNs en las exógenas del CSV. Revisa el archivo.")
         fut[exo_cols] = tbl[exo_cols].values
 
-    # el target futuro es desconocido
+    # target futuro: placeholder numérico (NO NaN) para evitar error del TimeSeriesDataSet
     fut["zone_1"] = 0.0
     fut["is_future"] = True
 
     # concatenamos histórico + futuro
     full = pd.concat([hist_df, fut], ignore_index=True)
+
+    # asegura tipo numérico para known real
+    full["is_future"] = full["is_future"].astype(int)
+
     return full
 
 
@@ -168,8 +173,16 @@ class DataManager:
         self.time_varying_unknown_reals: List[str] = []
 
     def make_training_from_hist(self, df: pd.DataFrame) -> TimeSeriesDataSet:
-        # variables
-        known_reals_base = ["time_idx", "hour", "day", "day_of_week", "month", "is_weekend", "is_holiday", "is_future"]
+        # Asegurar columna is_future presente y numérica (0/1),
+        # pero NO la pasamos como feature al modelo para calzar con el checkpoint.
+        if "is_future" not in df.columns:
+            df = df.copy()
+            df["is_future"] = 0
+        else:
+            df["is_future"] = df["is_future"].astype(int)
+
+        # === IMPORTANTEEEE: NO incluir is_future como known real ===
+        known_reals_base = ["time_idx", "hour", "day", "day_of_week", "month", "is_weekend", "is_holiday"]
         weather = ["temperature", "humidity"] + (["wind_speed"] if "wind_speed" in df.columns else []) + ["general_diffuse_flows"]
 
         if self.weather_as_known:
@@ -180,7 +193,7 @@ class DataManager:
             self.time_varying_unknown_reals = ["zone_1"] + weather
 
         training = TimeSeriesDataSet(
-            df,  # OJO: creamos sobre TODO el histórico
+            df,
             time_idx="time_idx",
             target="zone_1",
             group_ids=["zone"],
@@ -263,7 +276,9 @@ def plot_prediction_from_raw(raw, idx: int = 0, title="Predicción (p50) con ban
 
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(encoder_time, encoder_target, label="Histórico (encoder)", linewidth=1.5)
-    if len(decoder_target) and not np.isnan(decoder_target).all():
+
+    # Evita dibujar "real futuro" si es todo 0.0 (placeholder)
+    if len(decoder_target) and not (np.isnan(decoder_target).all() or np.allclose(decoder_target, 0.0)):
         ax.plot(decoder_time, decoder_target, label="Real futuro (si disponible)", linewidth=1.5)
 
     if 0.5 in q_idx:
@@ -371,15 +386,13 @@ if go_btn:
         with st.spinner("Inferencia…"):
             raw = mm.predict_raw(predict_dl)
 
-        # 7) Armar DF de salida y métricas (si existen y_true en ese rango)
+        # 7) Armar DF de salida
         preds_all = raw.output[0].detach().cpu().numpy()  # (N, L, Q)
         q_list = mm.tft.loss.quantiles
         def qidx(q): return q_list.index(q) if q in q_list else None
-        mid = qidx(0.5) or (len(q_list)//2)
+        mid = qidx(0.5) if qidx(0.5) is not None else (len(q_list)//2)
         p50 = preds_all[:, :, mid]
 
-        # Construcción de marco de resultados (solo 1 muestra si usamos todo el futuro en una sola ventana)
-        # Pero según tamaño del dataloader pueden generarse varias ventanas. Unimos todas.
         out_rows = []
         for i in range(p50.shape[0]):
             dec_time = raw.x["decoder_time_idx"][i].cpu().numpy().flatten()
@@ -399,21 +412,24 @@ if go_btn:
         st.subheader("Predicción (primer sample)")
         plot_prediction_from_raw(raw, idx=0)
 
-        # 9) Métricas (solo si y_true existe en el rango elegido)
-        if not np.isnan(pred_df["y_true"]).all():
+        # 9) Métricas SOLO sobre histórico (antes del inicio del futuro)
+        t0 = hist_df["datetime"].min()
+        future_start_idx = int(((pd.to_datetime(start_dt) - t0) / pd.Timedelta(minutes=10)))
+        mask_hist = pred_df["decoder_time_idx"] < future_start_idx
+
+        yt_hist = pred_df.loc[mask_hist, "y_true"].values
+        yp_hist = pred_df.loc[mask_hist, "y_pred_p50"].values
+
+        if yt_hist.size > 0 and not np.isnan(yt_hist).all():
             from sklearn.metrics import mean_absolute_error, mean_squared_error
-            yt = pred_df["y_true"].values
-            yp = pred_df["y_pred_p50"].values
-            mask = ~np.isnan(yt)
-            if mask.any():
-                mae = mean_absolute_error(yt[mask], yp[mask])
-                try:
-                    rmse = mean_squared_error(yt[mask], yp[mask], squared=False)
-                except TypeError:
-                    rmse = np.sqrt(mean_squared_error(yt[mask], yp[mask]))
-                st.markdown(f"**MAE:** {mae:.3f} — **RMSE:** {rmse:.3f}")
+            mae = mean_absolute_error(yt_hist, yp_hist)
+            try:
+                rmse = mean_squared_error(yt_hist, yp_hist, squared=False)
+            except TypeError:
+                rmse = np.sqrt(mean_squared_error(yt_hist, yp_hist))
+            st.markdown(f"**MAE (histórico):** {mae:.3f} — **RMSE (histórico):** {rmse:.3f}")
         else:
-            st.info("No hay valores reales para el horizonte elegido (solo predicción).")
+            st.info("No hay valores reales en el rango histórico del decoder para calcular métricas.")
 
         # 10) Tabla + descarga
         st.subheader("Predicciones (todas las ventanas generadas)")
