@@ -226,7 +226,6 @@ class ModelManager:
         self.quantiles = quantiles or QUANTILES
         self.tft: Optional[TemporalFusionTransformer] = None
 
-    @st.cache_resource(show_spinner=False)
     def build_model(_self):
         tft = TemporalFusionTransformer.from_dataset(
             _self.training_dataset,
