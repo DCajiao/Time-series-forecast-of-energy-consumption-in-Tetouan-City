@@ -371,8 +371,8 @@ def plot_prediction_from_raw(raw, idx: int = 0, title="Predicción (p50) con ban
 # UI
 # =========================
 st.set_page_config(page_title="TFT — Pronóstico con exógenas", layout="wide")
-st.title("🔌 TFT — Pronóstico de consumo (Zone_1) con entradas exógenas")
-st.caption("Carga modelo/datos desde GitHub, ingresa exógenas y genera pronóstico a 10 minutos.")
+st.title("⚡ TFT — Pronóstico de consumo en la zona 1 de Tetuán, Marruecos")
+st.caption("Ingresa variables exógenas y genera pronósticos con nuestro TFT entrenado.")
 
 with st.sidebar:
     st.header("Parámetros de pronóstico")
