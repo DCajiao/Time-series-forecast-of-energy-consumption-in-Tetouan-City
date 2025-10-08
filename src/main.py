@@ -54,12 +54,14 @@ def main():
         attention_head_size=4,
         dropout=0.1,
         hidden_continuous_size=32,
-        quantiles=[0.1, 0.5, 0.9],
         state_dict_url=args.state_dict_url,
     )
     mm.build_model()
-    print("Decoder known reals (esperamos +4 de clima):",
-        dm.training._get_masked_variables("decoder", "reals", known=True))
+    print("\n=== Chequeo de configuración ===")
+    print("Decoder KNOWN reals (según DataManager):", dm.time_varying_known_reals)
+    print("Decoder UNKNOWN reals (según DataManager):", dm.time_varying_unknown_reals)
+    print("Nº de cuantiles en el modelo:", len(mm.tft.loss.quantiles), "| Quantiles:", mm.tft.loss.quantiles)
+
     mm.load_state_dict_from_url()
 
     # 3) Predicción (validación como proxy)

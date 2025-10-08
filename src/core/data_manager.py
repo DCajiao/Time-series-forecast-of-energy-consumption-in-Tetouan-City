@@ -91,11 +91,11 @@ class DataManager:
         weather = ["temperature", "humidity", "wind_speed", "general_diffuse_flows"] if "wind_speed" in df.columns else ["temperature", "humidity", "general_diffuse_flows"]
 
         if self.weather_as_known:
-            time_varying_known_reals = known_reals + weather
-            time_varying_unknown_reals = ["zone_1"]
+            self.time_varying_known_reals = known_reals + weather
+            self.time_varying_unknown_reals = ["zone_1"]
         else:
-            time_varying_known_reals = known_reals
-            time_varying_unknown_reals = ["zone_1"] + weather
+            self.time_varying_known_reals = known_reals
+            self.time_varying_unknown_reals = ["zone_1"] + weather
 
         training = TimeSeriesDataSet(
             df[df.time_idx <= training_cutoff],
@@ -107,8 +107,8 @@ class DataManager:
             min_prediction_length=1,
             max_prediction_length=self.prediction_length,
             static_categoricals=["zone"],
-            time_varying_known_reals=time_varying_known_reals,
-            time_varying_unknown_reals=time_varying_unknown_reals,
+            time_varying_known_reals=self.time_varying_known_reals,
+            time_varying_unknown_reals=self.time_varying_unknown_reals,
             target_normalizer=GroupNormalizer(groups=["zone"]),
             add_relative_time_idx=True,
             add_target_scales=True,
