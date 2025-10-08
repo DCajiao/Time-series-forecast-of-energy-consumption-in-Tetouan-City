@@ -3,3 +3,7 @@
 .gitignore
 __pycache__/
 .ipynb_checkpoints/
+*.pyc
+test/
+__init__.py
+.DS_Store
