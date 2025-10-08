@@ -515,9 +515,14 @@ if go_btn:
                 rmse = mean_squared_error(yt_hist, yp_hist, squared=False)
             except TypeError:
                 rmse = np.sqrt(mean_squared_error(yt_hist, yp_hist))
-            st.markdown(f"**MAE (histórico):** {mae:.3f} — **RMSE (histórico):** {rmse:.3f}")
-        else:
-            st.info("No hay puntos históricos en el decoder para calcular métricas con el horizonte elegido.")
+
+            # MAPE (ignorar yt == 0 para evitar división por cero)
+            nz = yt_hist != 0
+            if nz.any():
+                mape = (np.abs((yt_hist[nz] - yp_hist[nz]) / yt_hist[nz]).mean()) * 100.0
+                st.markdown(f"**MAE (histórico):** {mae:.3f} — **RMSE (histórico):** {rmse:.3f} — **MAPE (histórico):** {mape:.2f}%")
+            else:
+                st.markdown(f"**MAE (histórico):** {mae:.3f} — **RMSE (histórico):** {rmse:.3f} — **MAPE (histórico):** N/A (target=0)")
 
         # 10) Tabla + descarga
         st.subheader("Predicciones (todas las ventanas generadas)")
