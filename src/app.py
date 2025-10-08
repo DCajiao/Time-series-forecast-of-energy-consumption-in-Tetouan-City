@@ -251,7 +251,7 @@ def plot_sample(raw, sample_idx: int, title: str = "Predicción (p50) con banda 
     preds = raw.output[0][sample_idx].detach().cpu().numpy()  # (L, n_quant)
 
     # Buscar índices de p10/p50/p90
-    q_list = raw.temporal_fusion_transformer.loss.quantiles if hasattr(raw, "temporal_fusion_transformer") else QUANTILES
+    q_list = QUANTILES
     def q_idx(q):
         return q_list.index(q) if q in q_list else None
 
@@ -308,9 +308,10 @@ with st.sidebar:
     st.code(f"CSV:  {RAW_DATA_URL}\nSTATE: {RAW_STATE_DICT_URL}", language="text")
     weather_known = st.checkbox("Tratar clima como KNOWN (coincide con checkpoint)", value=True, help="Dejar activado para usar el state_dict publicado")
     batch_size = st.slider("Batch size validación", min_value=16, max_value=256, value=64, step=16)
-    sample_to_plot = st.number_input("Sample del batch para graficar", min_value=0, value=0, step=1)
+    # Nota: el selector de sample lo pondremos después, cuando existan datos reales del batch
     run_btn = st.button("🚀 Cargar y predecir")
 
+# --------- Pipeline principal (solo al pulsar botón) ---------
 if run_btn:
     try:
         with st.spinner("Cargando datos desde GitHub y preparando dataset…"):
@@ -340,66 +341,96 @@ if run_btn:
             p50, raw = mm.predict_p50(val_loader)
 
         # Construir y_true para métricas
-        y_true_list = []
-        for _, yb in val_loader:
-            y_true_list.append(yb[0].detach().cpu().numpy())
+        y_true_list = [yb[0].detach().cpu().numpy() for _, yb in val_loader]
         y_true = np.concatenate(y_true_list, axis=0)
 
-        metrics = compute_metrics(y_true, p50)
-
-        col1, col2 = st.columns([1, 2], gap="large")
-        with col1:
-            st.subheader("Métricas (validación, p50)")
-            mtable = pd.DataFrame({
-                "Métrica": ["MAE", "RMSE", "MAPE", "sMAPE", "WAPE"],
-                "Valor": [
-                    f"{metrics['MAE']:.3f}",
-                    f"{metrics['RMSE']:.3f}",
-                    f"{metrics['MAPE']:.2f}%",
-                    f"{metrics['sMAPE']:.2f}%",
-                    f"{metrics['WAPE']:.2f}%"
-                ]
-            })
-            st.table(mtable)
-
-            # Último punto del horizonte del sample seleccionado
-            t_final = -1
-            try:
-                y_last = raw.x["decoder_target"][sample_to_plot][t_final].item()
-                preds_sample = raw.output[0][sample_to_plot].detach().cpu().numpy()
-                q_list = mm.tft.loss.quantiles
-                row = {"Valor real (último paso)": y_last}
-                for q in [0.1, 0.5, 0.9]:
-                    if q in q_list:
-                        qidx = q_list.index(q)
-                        row[f"p{int(q*100)}"] = float(preds_sample[t_final, qidx])
-                st.subheader("Último paso del horizonte (sample seleccionado)")
-                st.table(pd.DataFrame([row]))
-            except Exception as e:
-                st.warning(f"No se pudo mostrar el último paso: {e}")
-
-        with col2:
-            st.subheader("Predicción — sample seleccionado")
-            plot_sample(raw, sample_to_plot)
-
-        # Tabla de predicciones y descarga
-        st.subheader("Predicciones (todas las muestras del batch)")
-        pred_df = build_predictions_dataframe(raw, p50)
-        st.dataframe(pred_df.head(500), use_container_width=True)
-
-        csv_buf = io.StringIO()
-        pred_df.to_csv(csv_buf, index=False)
-        st.download_button(
-            label="⬇️ Descargar predicciones (CSV)",
-            data=csv_buf.getvalue(),
-            file_name="predicciones_tft_zone1.csv",
-            mime="text/csv",
-        )
+        # 🔒 Persistimos en sesión para reruns (por ejemplo, al cambiar el sample)
+        st.session_state["dm"] = dm
+        st.session_state["mm"] = mm
+        st.session_state["val_loader"] = val_loader
+        st.session_state["raw"] = raw
+        st.session_state["p50"] = p50
+        st.session_state["y_true"] = y_true
+        st.session_state["ready"] = True
 
     except Exception as ex:
         st.error(f"⚠️ Ocurrió un error: {ex}")
         st.stop()
 
+# --------- Visualización / Métricas usando estado persistente ---------
+if st.session_state.get("ready", False):
+    raw = st.session_state["raw"]
+    p50 = st.session_state["p50"]
+    y_true = st.session_state["y_true"]
+    val_loader = st.session_state["val_loader"]
+    dm: DataManager = st.session_state["dm"]
+    mm: ModelManager = st.session_state["mm"]
+
+    # Límite real del batch actual
+    num_samples = len(raw.x["decoder_target"])
+    col_sel, col_gap = st.columns([1, 3])
+    with col_sel:
+        sample_to_plot = st.number_input(
+            "Sample del batch para graficar",
+            min_value=0,
+            max_value=max(0, num_samples - 1),
+            value=min(st.session_state.get("sample_idx", 0), max(0, num_samples - 1)),
+            step=1,
+            key="sample_idx",
+            help="Cada sample es una ventana (encoder ~7d + decoder 24h) distinta dentro del batch actual."
+        )
+
+    # Métricas
+    metrics = compute_metrics(y_true, p50)
+
+    col1, col2 = st.columns([1, 2], gap="large")
+    with col1:
+        st.subheader("Métricas (validación, p50)")
+        mtable = pd.DataFrame({
+            "Métrica": ["MAE", "RMSE", "MAPE", "sMAPE", "WAPE"],
+            "Valor": [
+                f"{metrics['MAE']:.3f}",
+                f"{metrics['RMSE']:.3f}",
+                f"{metrics['MAPE']:.2f}%",
+                f"{metrics['sMAPE']:.2f}%",
+                f"{metrics['WAPE']:.2f}%"
+            ]
+        })
+        st.table(mtable)
+
+        # Último punto del horizonte del sample seleccionado
+        t_final = -1
+        try:
+            y_last = raw.x["decoder_target"][sample_to_plot][t_final].item()
+            preds_sample = raw.output[0][sample_to_plot].detach().cpu().numpy()
+            q_list = mm.tft.loss.quantiles
+            row = {"Valor real (último paso)": y_last}
+            for q in [0.1, 0.5, 0.9]:
+                if q in q_list:
+                    qidx = q_list.index(q)
+                    row[f"p{int(q*100)}"] = float(preds_sample[t_final, qidx])
+            st.subheader("Último paso del horizonte (sample seleccionado)")
+            st.table(pd.DataFrame([row]))
+        except Exception as e:
+            st.warning(f"No se pudo mostrar el último paso: {e}")
+
+    with col2:
+        st.subheader("Predicción — sample seleccionado")
+        plot_sample(raw, int(sample_to_plot))
+
+    # Tabla de predicciones y descarga
+    st.subheader("Predicciones (todas las muestras del batch)")
+    pred_df = build_predictions_dataframe(raw, p50)
+    st.dataframe(pred_df.head(500), width='stretch')  # ← evita deprecación use_container_width
+
+    csv_buf = io.StringIO()
+    pred_df.to_csv(csv_buf, index=False)
+    st.download_button(
+        label="⬇️ Descargar predicciones (CSV)",
+        data=csv_buf.getvalue(),
+        file_name="predicciones_tft_zone1.csv",
+        mime="text/csv",
+    )
 
 # ====== Footer ======
 st.markdown("---")
